@@ -1,4 +1,4 @@
-# 🎬 CineMatch — Hybrid Movie Recommender System
+# CineMatch — Hybrid Movie Recommender System
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://python.org)
 [![Tests](https://img.shields.io/badge/tests-24%20passed-brightgreen.svg)](#testing)
@@ -6,11 +6,11 @@
 
 A production-ready recommender system built from scratch in Python, implementing and comparing three recommendation strategies — Collaborative Filtering, Matrix Factorization, and Content-Based Filtering — fused into a weighted hybrid ensemble.
 
-> **Resume highlight:** Implements 4 algorithms, 7 evaluation metrics, a full train/test pipeline, 24 unit tests, and a model explainability interface — all without black-box libraries like Surprise or LightFM.
+> **Highlights:** Implements 4 algorithms, 7 evaluation metrics, a full train/test pipeline, 24 unit tests, and a model explainability interface — all without black-box libraries like Surprise or LightFM.
 
 ---
 
-## 📌 Table of Contents
+## Table of Contents
 
 - [Project Overview](#project-overview)
 - [Architecture](#architecture)
