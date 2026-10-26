@@ -8,14 +8,17 @@ Matrix Factorization, and Content-Based Filtering via weighted score fusion.
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from typing import List, Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional
 import logging
 
 from .collaborative_filter import CollaborativeFilter
-from .matrix_factorization import MatrixFactorization
+from .matrix_factorization import MatrixFactorization, DEFAULT_N_FACTORS
 from .content_based import ContentBasedFilter
 
 logger = logging.getLogger(__name__)
+
+# Blend weights (CF, MF, CB) chosen by train.py on a validation split
+DEFAULT_WEIGHTS = (0.6, 0.4, 0.0)
 
 
 class HybridRecommender:
@@ -25,7 +28,9 @@ class HybridRecommender:
     The final score for each candidate item is:
         score = w_cf * cf_score + w_mf * mf_score + w_cb * cb_score
 
-    Weights are normalised to sum to 1.0 internally.
+    where cf_score is the item-KNN neighbourhood score, mf_score the SVD
+    predicted rating and cb_score the genre similarity to the user's taste,
+    each min-max scaled to [0, 1]. Weights are normalised to sum to 1.0 internally.
 
     Parameters
     ----------
@@ -38,18 +43,17 @@ class HybridRecommender:
 
     def __init__(
         self,
-        w_cf: float = 0.3,
-        w_mf: float = 0.5,
-        w_cb: float = 0.2,
-        n_factors: int = 50,
+        w_cf: float = DEFAULT_WEIGHTS[0],
+        w_mf: float = DEFAULT_WEIGHTS[1],
+        w_cb: float = DEFAULT_WEIGHTS[2],
+        n_factors: int = DEFAULT_N_FACTORS,
         cf_k: int = 20,
     ):
-        total = w_cf + w_mf + w_cb
-        self.w_cf = w_cf / total
-        self.w_mf = w_mf / total
-        self.w_cb = w_cb / total
+        self.set_weights(w_cf, w_mf, w_cb)
 
-        self.cf = CollaborativeFilter(mode="item", k=cf_k, mean_center=True)
+        # Plain cosine on raw ratings: for ranking, "watched by the same people"
+        # beats mean-centred rating agreement
+        self.cf = CollaborativeFilter(mode="item", k=cf_k, mean_center=False)
         self.mf = MatrixFactorization(n_factors=n_factors)
         self.cb = ContentBasedFilter()
 
@@ -60,6 +64,14 @@ class HybridRecommender:
         self.reverse_item_map: dict = {}
         self.user_id_map: dict = {}
         self._fitted = False
+
+    def set_weights(self, w_cf: float, w_mf: float, w_cb: float) -> "HybridRecommender":
+        """Set the blend weights, normalised to sum to 1.0."""
+        total = w_cf + w_mf + w_cb
+        self.w_cf = w_cf / total
+        self.w_mf = w_mf / total
+        self.w_cb = w_cb / total
+        return self
 
     def fit(
         self,
@@ -96,20 +108,75 @@ class HybridRecommender:
 
         logger.info("[3/3] Fitting Content-Based Filter...")
         self.cb.fit(movies)
+        # Internal item index of each movie in the CB profiles; -1 for movies
+        # dropped in preprocessing, which have no index
+        self._cb_item_index = np.array([item_id_map.get(mid, -1) for mid in self.cb.movie_ids])
 
         self._fitted = True
         logger.info("=== Training complete ===")
         return self
 
-    def _normalize_scores(self, items_scores: List[Tuple[int, float]]) -> Dict[int, float]:
-        """Min-max normalize a list of (item_idx, score) to [0, 1]."""
-        if not items_scores:
-            return {}
-        scores = np.array([s for _, s in items_scores])
+    @staticmethod
+    def _normalize_scores(scores: np.ndarray) -> np.ndarray:
+        """Min-max normalize scores to [0, 1]; constant scores all become 0.5."""
+        if scores.size == 0:
+            return scores
         mn, mx = scores.min(), scores.max()
         if mx - mn < 1e-9:
-            return {i: 0.5 for i, _ in items_scores}
-        return {i: float((s - mn) / (mx - mn)) for i, s in items_scores}
+            return np.full(scores.shape, 0.5)
+        return (scores - mn) / (mx - mn)
+
+    def _cb_item_scores(self, user_id: int) -> np.ndarray:
+        """Content-based score for every item, in internal item-index order."""
+        user_ratings = self.ratings[self.ratings["userId"] == user_id]
+        by_movie = self.cb.score_movies(user_ratings)
+        known = self._cb_item_index >= 0
+        scores = np.zeros(self.user_item_matrix.shape[1])
+        scores[self._cb_item_index[known]] = by_movie[known]
+        return scores
+
+    def component_scores(
+        self, user_id: int, exclude_seen: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Score every candidate item with each sub-model, min-max scaled to [0, 1].
+
+        Parameters
+        ----------
+        user_id : int        Raw (original) userId.
+        exclude_seen : bool  Leave out items the user has already rated.
+
+        Returns
+        -------
+        (candidates, cf, mf, cb): candidate item indices and three aligned score arrays.
+        """
+        assert self._fitted, "Call .fit() before scoring"
+
+        user_idx = self.user_id_map.get(user_id)
+        if user_idx is None:
+            raise ValueError(f"userId {user_id} not found in training data.")
+
+        n_items = self.user_item_matrix.shape[1]
+        keep = np.ones(n_items, dtype=bool)
+        if exclude_seen:
+            keep[self.user_item_matrix.getrow(user_idx).nonzero()[1]] = False
+        candidates = np.flatnonzero(keep)
+
+        cf_scores = self.cf.neighborhood_scores(user_idx)
+
+        user_vec = self.mf.user_factors[user_idx]
+        mf_scores = np.clip(
+            self.mf.item_factors @ user_vec + self.mf.user_means[user_idx], 1.0, 5.0
+        )
+
+        cb_scores = self._cb_item_scores(user_id)
+
+        return (
+            candidates,
+            self._normalize_scores(cf_scores[candidates]),
+            self._normalize_scores(mf_scores[candidates]),
+            self._normalize_scores(cb_scores[candidates]),
+        )
 
     def recommend(
         self,
@@ -130,48 +197,12 @@ class HybridRecommender:
         -------
         pd.DataFrame with columns: rank, movieId, title, genres, predicted_score.
         """
-        assert self._fitted, "Call .fit() before .recommend()"
-
-        user_idx = self.user_id_map.get(user_id)
-        if user_idx is None:
-            raise ValueError(f"userId {user_id} not found in training data.")
-
-        n_items = self.user_item_matrix.shape[1]
-        seen = set(self.user_item_matrix.getrow(user_idx).nonzero()[1])
-        candidates = [i for i in range(n_items) if not (exclude_seen and i in seen)]
-
-        # --- CF scores (item-based) ---
-        cf_raw = [(i, self.cf.predict_user_item(user_idx, i)) for i in candidates]
-        cf_norm = self._normalize_scores(cf_raw)
-
-        # --- MF scores ---
-        user_vec = self.mf.user_factors[user_idx]
-        mf_scores = self.mf.item_factors @ user_vec + self.mf.user_means[user_idx]
-        mf_scores = np.clip(mf_scores, 1.0, 5.0)
-        mf_raw = [(i, float(mf_scores[i])) for i in candidates]
-        mf_norm = self._normalize_scores(mf_raw)
-
-        # --- CB scores ---
-        user_ratings = self.ratings[self.ratings["userId"] == user_id]
-        cb_recs = self.cb.recommend(user_ratings, n=len(candidates) + 50, exclude_seen=False)
-        # CB returns (movieId, score) — convert to item_idx space
-        cb_by_movie = {self.item_id_map.get(mid): sc for mid, sc in cb_recs
-                       if self.item_id_map.get(mid) is not None}
-        cb_raw = [(i, cb_by_movie.get(i, 0.0)) for i in candidates]
-        cb_norm = self._normalize_scores(cb_raw)
+        candidates, cf_norm, mf_norm, cb_norm = self.component_scores(user_id, exclude_seen)
 
         # --- Weighted fusion ---
-        fused = []
-        for i in candidates:
-            score = (
-                self.w_cf * cf_norm.get(i, 0.0) +
-                self.w_mf * mf_norm.get(i, 0.0) +
-                self.w_cb * cb_norm.get(i, 0.0)
-            )
-            fused.append((i, score))
-
-        fused.sort(key=lambda x: x[1], reverse=True)
-        top = fused[:n]
+        fused = self.w_cf * cf_norm + self.w_mf * mf_norm + self.w_cb * cb_norm
+        order = np.argsort(-fused, kind="stable")[:n]
+        top = [(int(candidates[j]), float(fused[j])) for j in order]
 
         # Map back to movieIds and enrich with metadata
         rows = []
@@ -194,6 +225,8 @@ class HybridRecommender:
         """
         Return per-model score breakdown for a (user, item) pair.
 
+        Each score is the sub-model's raw score before scaling: the CF
+        neighbourhood score, the MF predicted rating and the CB genre similarity.
         Useful for interpretability and debugging.
         """
         assert self._fitted
@@ -202,11 +235,9 @@ class HybridRecommender:
         if user_idx is None or item_idx is None:
             return {"error": "user_id or movie_id not found"}
 
-        cf_score = self.cf.predict_user_item(user_idx, item_idx)
+        cf_score = float(self.cf.neighborhood_scores(user_idx)[item_idx])
         mf_score = self.mf.predict(user_idx, item_idx)
-        user_ratings = self.ratings[self.ratings["userId"] == user_id]
-        cb_recs = dict(self.cb.recommend(user_ratings, n=500, exclude_seen=False))
-        cb_score = cb_recs.get(movie_id, 0.0)
+        cb_score = float(self._cb_item_scores(user_id)[item_idx])
 
         return {
             "userId": user_id,

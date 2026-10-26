@@ -18,6 +18,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Latent factors chosen by train.py on a validation split
+DEFAULT_N_FACTORS = 10
+
 
 class MatrixFactorization:
     """
@@ -32,7 +35,7 @@ class MatrixFactorization:
         Number of latent factors (dimensionality of embeddings).
     """
 
-    def __init__(self, n_factors: int = 50):
+    def __init__(self, n_factors: int = DEFAULT_N_FACTORS):
         self.n_factors = n_factors
         self.user_factors: np.ndarray = None   # shape (n_users, n_factors)
         self.item_factors: np.ndarray = None   # shape (n_items, n_factors)

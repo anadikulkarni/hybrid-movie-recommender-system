@@ -40,6 +40,7 @@ class CollaborativeFilter:
         self.similarity_matrix: np.ndarray = None
         self.user_item_matrix: csr_matrix = None
         self.user_means: np.ndarray = None
+        self._ratings: np.ndarray = None  # dense copy of the ratings, built once in fit()
 
     def fit(self, user_item_matrix: csr_matrix) -> "CollaborativeFilter":
         """
@@ -51,7 +52,8 @@ class CollaborativeFilter:
             Shape (n_users, n_items) with explicit zeros for unrated items.
         """
         self.user_item_matrix = user_item_matrix
-        matrix = user_item_matrix.toarray().astype(float)
+        self._ratings = user_item_matrix.toarray().astype(float)
+        matrix = self._ratings.copy()
 
         if self.mean_center:
             # Replace 0 (unrated) with NaN for proper mean calculation
@@ -75,7 +77,7 @@ class CollaborativeFilter:
 
     def predict_user_item(self, user_idx: int, item_idx: int) -> float:
         """Predict rating for a (user_idx, item_idx) pair."""
-        matrix = self.user_item_matrix.toarray().astype(float)
+        matrix = self._ratings
 
         if self.mode == "item":
             item_sims = self.similarity_matrix[item_idx]
@@ -89,6 +91,10 @@ class CollaborativeFilter:
 
             sims = item_sims[rated_mask]
             ratings = user_ratings[rated_mask]
+            if self.mean_center:
+                # Neighbours vote with the user's deviations from their own mean,
+                # which are added back to that mean below
+                ratings = ratings - self.user_means[user_idx, 0]
 
             # Top-k neighbors
             top_k = min(self.k, len(sims))
@@ -136,11 +142,34 @@ class CollaborativeFilter:
                 pred += self.user_means[user_idx, 0]
             return float(np.clip(pred, 1.0, 5.0))
 
+    def neighborhood_scores(self, user_idx: int) -> np.ndarray:
+        """
+        Top-N score for every item (item-based mode): the sum of its similarities
+        to all the items the user has rated (Deshpande & Karypis, 2004).
+
+        This measures how closely an item is tied to the user's history rather
+        than what they would rate it. Ranking by predicted rating instead pushes
+        obscure items with a couple of glowing neighbours to the top.
+
+        Returns
+        -------
+        np.ndarray of shape (n_items,).
+        """
+        assert self.mode == "item", "neighborhood_scores requires mode='item'"
+        rated = np.flatnonzero(self._ratings[user_idx])
+        scores = self.similarity_matrix[:, rated].sum(axis=1)
+        # A rated item's own self-similarity is not a vote for it
+        scores[rated] -= self.similarity_matrix[rated, rated]
+        return scores
+
     def recommend(
         self, user_idx: int, n: int = 10, exclude_seen: bool = True
     ) -> List[Tuple[int, float]]:
         """
         Recommend top-N items for a user.
+
+        Item-based mode ranks by neighborhood_scores; user-based mode ranks by
+        predicted rating.
 
         Parameters
         ----------
@@ -153,19 +182,21 @@ class CollaborativeFilter:
 
         Returns
         -------
-        List of (item_idx, predicted_score) tuples sorted descending.
+        List of (item_idx, score) tuples sorted descending.
         """
-        matrix = self.user_item_matrix.toarray().astype(float)
-        user_ratings = matrix[user_idx]
-        n_items = matrix.shape[1]
+        user_ratings = self._ratings[user_idx]
+        n_items = self._ratings.shape[1]
 
-        candidates = []
-        for item_idx in range(n_items):
-            if exclude_seen and user_ratings[item_idx] != 0:
-                continue
-            score = self.predict_user_item(user_idx, item_idx)
-            candidates.append((item_idx, score))
+        if self.mode == "item":
+            scores = self.neighborhood_scores(user_idx)
+        else:
+            scores = np.array([self.predict_user_item(user_idx, i) for i in range(n_items)])
 
+        candidates = [
+            (item_idx, float(scores[item_idx]))
+            for item_idx in range(n_items)
+            if not (exclude_seen and user_ratings[item_idx] != 0)
+        ]
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[:n]
 

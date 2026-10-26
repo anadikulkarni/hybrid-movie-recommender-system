@@ -100,6 +100,21 @@ class ContentBasedFilter:
         norm = np.linalg.norm(profile)
         return profile / norm if norm > 1e-9 else profile
 
+    def score_movies(
+        self, user_ratings: pd.DataFrame, rating_threshold: float = 3.5
+    ) -> np.ndarray:
+        """
+        Cosine similarity of every movie to the user's taste profile.
+
+        Returns
+        -------
+        np.ndarray aligned with self.movie_ids; all zeros if no profile can be built.
+        """
+        user_profile = self.build_user_profile(user_ratings, rating_threshold)
+        if user_profile is None:
+            return np.zeros(len(self.movie_ids))
+        return cosine_similarity([user_profile], self.item_profiles)[0]
+
     def recommend(
         self,
         user_ratings: pd.DataFrame,

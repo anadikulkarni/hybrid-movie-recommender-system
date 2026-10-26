@@ -4,7 +4,7 @@ setup(
     name="cinematch",
     version="1.0.0",
     description="A hybrid movie recommender system using Collaborative Filtering, Matrix Factorization, and Content-Based Filtering.",
-    author="Your Name",
+    author="Anadi Kulkarni",
     packages=find_packages(include=["src", "src.*"]),
     python_requires=">=3.9",
     install_requires=[

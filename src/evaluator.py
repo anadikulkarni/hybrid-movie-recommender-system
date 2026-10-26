@@ -11,7 +11,7 @@ Evaluation metrics for recommender systems:
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,8 @@ class Evaluator:
         recommend_fn: Callable[[int, int], list],
         user_id_map: dict,
         k: int = 10,
-        n_users: int = 100,
+        n_users: Optional[int] = 100,
+        random_state: int = 42,
     ) -> Dict[str, float]:
         """
         Evaluate ranking quality on a sample of test users.
@@ -162,15 +163,25 @@ class Evaluator:
         recommend_fn : callable   Takes (userId, n) → list of movieIds.
         user_id_map : dict        Maps raw userId → internal index.
         k : int                   Cutoff rank.
-        n_users : int             Number of users to evaluate.
+        n_users : int or None     Number of users to evaluate; None evaluates every test user.
+        random_state : int        Seed for the user sample, so results are repeatable.
 
         Returns
         -------
         Dict with mean Precision@K, Recall@K, F1@K, NDCG@K, MAP@K.
         """
         test_users = self.test["userId"].unique()
-        sampled = np.random.choice(
-            test_users, size=min(n_users, len(test_users)), replace=False
+        if n_users is not None and n_users < len(test_users):
+            rng = np.random.default_rng(random_state)
+            sampled = rng.choice(test_users, size=n_users, replace=False)
+        else:
+            sampled = test_users
+
+        relevant_by_user = (
+            self.test[self.test["rating"] >= self.threshold]
+            .groupby("userId")["movieId"]
+            .apply(set)
+            .to_dict()
         )
 
         metrics = {"precision": [], "recall": [], "f1": [], "ndcg": [], "ap": []}
@@ -179,12 +190,7 @@ class Evaluator:
             if user_id not in user_id_map:
                 continue
 
-            relevant = set(
-                self.test[
-                    (self.test["userId"] == user_id) &
-                    (self.test["rating"] >= self.threshold)
-                ]["movieId"].values
-            )
+            relevant = relevant_by_user.get(user_id, set())
             if not relevant:
                 continue
 
@@ -193,7 +199,7 @@ class Evaluator:
             except Exception:
                 continue
 
-            rec_ids = [r if isinstance(r, int) else r[0] for r in recs]
+            rec_ids = [r if isinstance(r, (int, np.integer)) else r[0] for r in recs]
 
             metrics["precision"].append(precision_at_k(rec_ids, relevant, k))
             metrics["recall"].append(recall_at_k(rec_ids, relevant, k))
@@ -201,11 +207,12 @@ class Evaluator:
             metrics["ndcg"].append(ndcg_at_k(rec_ids, relevant, k))
             metrics["ap"].append(average_precision(rec_ids, relevant, k))
 
-        result = {f"Precision@{k}": round(np.mean(metrics["precision"]), 4),
-                  f"Recall@{k}": round(np.mean(metrics["recall"]), 4),
-                  f"F1@{k}": round(np.mean(metrics["f1"]), 4),
-                  f"NDCG@{k}": round(np.mean(metrics["ndcg"]), 4),
-                  f"MAP@{k}": round(np.mean(metrics["ap"]), 4),
+        # Plain floats, so the results can go straight into json.dump
+        result = {f"Precision@{k}": round(float(np.mean(metrics["precision"])), 4),
+                  f"Recall@{k}": round(float(np.mean(metrics["recall"])), 4),
+                  f"F1@{k}": round(float(np.mean(metrics["f1"])), 4),
+                  f"NDCG@{k}": round(float(np.mean(metrics["ndcg"])), 4),
+                  f"MAP@{k}": round(float(np.mean(metrics["ap"])), 4),
                   "n_users_evaluated": len(metrics["precision"])}
         return result
 
